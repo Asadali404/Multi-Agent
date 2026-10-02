@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
 os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
@@ -347,12 +348,52 @@ def _architect(llm: LLM) -> Agent:
     )
 
 
+DIAG = {"parsed_3a": 0, "valid_3a": 0}
+_ALIASES = {
+    "scholarship_name": ("scholarship_name", "name", "title", "scholarship", "program", "programme", "fellowship"),
+    "official_link": ("official_link", "link", "url", "website", "official_url"),
+    "provider": ("provider", "organization", "organisation", "institution", "university", "funder", "sponsor"),
+    "requirements": ("requirements", "eligibility", "documents"),
+    "funding": ("funding", "benefits", "coverage"),
+}
+
+
+def _normalize_item(item) -> Optional[dict]:
+    """Accept common alternative key names the model may use."""
+    if not isinstance(item, dict):
+        return None
+    out = {str(k).lower(): v for k, v in item.items()}
+    for target, names in _ALIASES.items():
+        if not out.get(target):
+            for n in names:
+                if out.get(n):
+                    out[target] = out[n]
+                    break
+    return out
+
+
+def records_from_raw(raw: List[RawResult], profile: CandidateProfile, level: str) -> List[ScholarshipRecord]:
+    """Code-only fallback: one low-confidence record per search result (no guessing, deadline stays null)."""
+    out = []
+    for r in raw:
+        text = f"{r.title} {r.snippet}".lower()
+        country = next((c for c in profile.countries if c.lower() in text), "Unknown")
+        host = urlparse(r.url).netloc.replace("www.", "")
+        out.append(ScholarshipRecord(
+            scholarship_name=(r.title or host)[:140], provider=host, level=level, country=country,
+            official_link=r.url, funding=r.snippet[:140],
+            notes="Auto-built from a search result - open the link to confirm details and deadline.",
+        ))
+    return out
+
+
 def _task_3a(raw: List[RawResult], level: str, llm: LLM) -> List[ScholarshipRecord]:
     payload = [{"title": r.title[:120], "url": r.url, "snippet": r.snippet[:280], "page": r.page_text[:500]} for r in raw]
     description = (
         "You are given web search results about scholarships. Build a clean database.\n"
-        "Create one record per DISTINCT real scholarship, fellowship or funded position (skip news, listicles and "
-        "duplicates unless a page clearly describes one programme).\n"
+        "Create one record per DISTINCT scholarship, fellowship or funded position. Skip exact duplicates. If a result is a "
+        "general article, create records only for programmes it clearly names. When unsure whether a result is a programme, "
+        "still include it with confidence \"low\". Return at least one record if any result is relevant.\n"
         "RULES: use only information present in the results. NEVER guess a deadline: if no explicit date for the "
         "current cycle is shown, set deadline to null and confidence to \"low\". Use \"high\" only if the date and "
         "requirements are explicit on an official page, \"medium\" if the page is reliable but partly unclear. "
@@ -366,9 +407,14 @@ def _task_3a(raw: List[RawResult], level: str, llm: LLM) -> List[ScholarshipReco
     data = _run_json(lambda: _architect(llm), description, "A valid JSON array of scholarship records.",
                      dict(level=level, results_json=json.dumps(payload, ensure_ascii=False)))
     if isinstance(data, dict):
-        data = data.get("records") or data.get("scholarships") or next((v for v in data.values() if isinstance(v, list)), [])
+        data = data.get("records") or data.get("scholarships") or next((v for v in data.values() if isinstance(v, list)), [data])
+    if not isinstance(data, list):
+        data = []
     records, seen = [], set()
     for item in data:
+        item = _normalize_item(item)
+        if not item:
+            continue
         try:
             rec = ScholarshipRecord(**item)
         except Exception:
@@ -378,6 +424,7 @@ def _task_3a(raw: List[RawResult], level: str, llm: LLM) -> List[ScholarshipReco
             continue
         seen.add(key)
         records.append(rec)
+    DIAG["parsed_3a"], DIAG["valid_3a"] = len(data), len(records)
     return records
 
 
@@ -442,6 +489,11 @@ def build_database_and_gaps(profile: CandidateProfile, raw: List[RawResult], lev
         except Exception as exc:
             gap = GapReport()
             warning += f" Gap analysis failed: {str(exc)[:120]}"
+
+    if not records and not from_seed:
+        records = records_from_raw(raw, profile, level)
+        warning += (f" The database agent produced no usable records (parsed {DIAG['parsed_3a']}, valid {DIAG['valid_3a']}); "
+                    "records were built directly from the search results instead. Verify details on each page.")
 
     # merge in code
     by_url = {tools.norm_url(i.url): i for i in gap.per_item if i.url}
