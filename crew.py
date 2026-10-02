@@ -21,6 +21,9 @@ import tracker  # noqa: E402
 from schemas import CandidateProfile, GapReport, RawResult, ScholarshipRecord  # noqa: E402
 
 DEFAULT_MODEL = "openai/gpt-oss-120b"  # confirm exact ID + free-tier limits in the Groq console
+# gpt-oss models emit native tool calls that break CrewAI's text-based tool loop on Groq,
+# so the tool-using Scout agent runs on a model without that problem.
+DEFAULT_SCOUT_MODEL = "llama-3.3-70b-versatile"
 SEED_PATH = Path(__file__).parent / "data" / "seed_scholarships.json"
 
 
@@ -165,6 +168,15 @@ def analyze_profile(cv_text: str, interests: str, domain: str, countries: List[s
 # ----------------------------------------------------------------------------
 # Agent 2 - Opportunity Scout (ddg_search, hard cap)
 # ----------------------------------------------------------------------------
+def _fallback_queries(profile: CandidateProfile, level: str) -> List[str]:
+    year = date.today().year
+    base = profile.target_domain or (profile.research_interests[0] if profile.research_interests else (profile.field_of_study or ""))
+    qs = [f"{level} fully funded scholarship {c} {base} {year}".replace("  ", " ") for c in profile.countries]
+    qs.append(f"{level} scholarship {' '.join(profile.keywords[:3])} {year}")
+    qs.append(f"fully funded {level} fellowship {base} apply {year}".replace("  ", " "))
+    return qs
+
+
 def scout_opportunities(profile: CandidateProfile, level: str, max_searches: int, llm: LLM) -> Tuple[List[RawResult], List[str], str]:
     """Returns (raw_results deduplicated by URL, queries used, warning)."""
     max_searches = max(1, min(int(max_searches), 5))
@@ -191,7 +203,14 @@ def scout_opportunities(profile: CandidateProfile, level: str, max_searches: int
              dict(year=date.today().year, keywords=", ".join(profile.keywords), countries=", ".join(profile.countries),
                   level=level, max_searches=max_searches))
     except Exception as exc:  # keep whatever the tool already collected
-        warning = f"Scout agent stopped early: {str(exc)[:160]}"
+        warning = f"Scout agent stopped early ({str(exc)[:110]}); remaining searches were run directly."
+
+    # Safety net: if the agent loop failed or found nothing, spend the remaining budget on code-built queries.
+    if warning or not tools.collected_results():
+        for q in _fallback_queries(profile, level):
+            if tools.BUDGET.used >= tools.BUDGET.max_calls:
+                break
+            tools.run_search(q)
 
     # Results are harvested in code from the tool -> deduplicated, ranked by source trust.
     seen, raw = set(), []
