@@ -65,10 +65,6 @@ with st.sidebar:
     custom = st.text_input("Other countries (comma-separated)")
     max_searches = st.slider("Max searches", 1, 5, 5)
     with st.expander("Advanced"):
-        model_id = st.text_input("Groq model ID", value=os.getenv("GROQ_MODEL", sh_crew.DEFAULT_MODEL),
-                                 help="Confirm the exact ID and free-tier limits in the Groq console.")
-        scout_model = st.text_input("Scout agent model (uses the search tool)", value=os.getenv("GROQ_SCOUT_MODEL", sh_crew.DEFAULT_SCOUT_MODEL),
-                                    help="gpt-oss models break CrewAI's tool loop on Groq, so the Scout uses a different model.")
         parallel = st.checkbox("Run Tasks 3a/3b in parallel", value=True,
                                help="Turn off if you hit Groq free-tier rate limits.")
     run_clicked = st.button("🚀 Run Agents", type="primary", use_container_width=True)
@@ -127,15 +123,14 @@ def execute():
         paint()
         warnings = []
         try:
-            llm = sh_crew.get_llm(api_key, model_id)
+            llm = sh_crew.get_llm(api_key)
 
             step("Profile", "run")
             profile = sh_crew.analyze_profile(cv_text, interests, domain, countries, level, llm)
             step("Profile", "done")
 
             step("Scout", "run")
-            scout_llm = sh_crew.get_llm(api_key, scout_model)
-            raw, queries, warn = sh_crew.scout_opportunities(profile, level, max_searches, scout_llm)
+            raw, queries, warn = sh_crew.scout_opportunities(profile, level, max_searches, llm)
             if warn:
                 warnings.append(warn)
             step("Scout", "done")
@@ -270,7 +265,7 @@ with tab_tracker:
             key = get_api_key()
             if key:
                 with st.spinner("Writing summary..."):
-                    st.session_state.summary = sh_crew.tracker_summary(work, sh_crew.get_llm(key, model_id))
+                    st.session_state.summary = sh_crew.tracker_summary(work, sh_crew.get_llm(key))
                 st.rerun()
             else:
                 st.error("GROQ_API_KEY not found in Secrets.")
