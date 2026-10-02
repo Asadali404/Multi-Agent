@@ -40,12 +40,11 @@ for key, default in {
     st.session_state.setdefault(key, default)
 
 
-def get_api_key(typed: str) -> str:
-    if typed.strip():
-        return typed.strip()
+def get_api_key() -> str:
+    """Key comes from Streamlit secrets (or a .env / environment variable), never from the UI."""
     try:
         if "GROQ_API_KEY" in st.secrets:
-            return str(st.secrets["GROQ_API_KEY"]).strip()
+            return str(st.secrets["GROQ_API_KEY"]).strip().strip('"').strip("'")
     except Exception:
         pass
     return os.getenv("GROQ_API_KEY", "").strip()
@@ -70,18 +69,31 @@ with st.sidebar:
                                  help="Confirm the exact ID and free-tier limits in the Groq console.")
         parallel = st.checkbox("Run Tasks 3a/3b in parallel", value=True,
                                help="Turn off if you hit Groq free-tier rate limits.")
-        typed_key = st.text_input("GROQ_API_KEY (optional if set in .env / secrets)", type="password")
     run_clicked = st.button("🚀 Run Agents", type="primary", use_container_width=True)
+    if st.button("🔌 Test Groq connection", use_container_width=True):
+        import requests
+
+        _key = get_api_key()
+        if not _key:
+            st.error("GROQ_API_KEY not found in Secrets.")
+        else:
+            try:
+                _r = requests.get("https://api.groq.com/openai/v1/models",
+                                  headers={"Authorization": f"Bearer {_key}"}, timeout=15)
+                st.write(f"HTTP {_r.status_code}")
+                st.code(_r.text[:300])
+            except Exception as exc:
+                st.error(str(exc)[:300])
 
 tab_discover, tab_gap, tab_tracker, tab_export = st.tabs(["Discover", "Gap Analysis", "Tracker", "Export"])
 
 
 # ------------------------------------------------------------------ pipeline
 def execute():
-    api_key = get_api_key(typed_key)
+    api_key = get_api_key()
     countries = list(dict.fromkeys(selected + [c.strip() for c in custom.split(",") if c.strip()]))
     if not api_key:
-        st.error("Add your GROQ_API_KEY (sidebar > Advanced, .env or Streamlit secrets).")
+        st.error("GROQ_API_KEY not found. Add it under App settings > Secrets.")
         return
     if not cv_file and not interests.strip():
         st.error("Upload a CV or enter research interests.")
@@ -145,7 +157,11 @@ def execute():
             paint()
             status.update(label="Run failed", state="error")
             st.error(f"{type(exc).__name__}: {str(exc)[:400]}")
-            st.info("Tip: on rate-limit errors, untick 'Run Tasks 3a/3b in parallel' or retry in a minute.")
+            if "access denied" in str(exc).lower():
+                st.info("Groq blocked this request before it reached your account (network/IP level). "
+                        "Use 'Test Groq connection' in the sidebar, then reboot the app to get a different host.")
+            else:
+                st.info("Tip: on rate-limit errors, untick 'Run Tasks 3a/3b in parallel' or retry in a minute.")
             return
         status.update(label="All agents finished", state="complete", expanded=False)
 
@@ -248,13 +264,13 @@ with tab_tracker:
         st.subheader("🗓️ Weekly priorities")
         st.markdown(st.session_state.summary or tracker.plain_summary(work))
         if st.button("Regenerate summary"):
-            key = get_api_key(typed_key)
+            key = get_api_key()
             if key:
                 with st.spinner("Writing summary..."):
                     st.session_state.summary = sh_crew.tracker_summary(work, sh_crew.get_llm(key, model_id))
                 st.rerun()
             else:
-                st.error("GROQ_API_KEY missing.")
+                st.error("GROQ_API_KEY not found in Secrets.")
 
         st.subheader("🔥 Urgent deadlines")
         urgent = tracker.urgent_list(work)
