@@ -67,6 +67,8 @@ with st.sidebar:
     with st.expander("Advanced"):
         model_id = st.text_input("Groq model ID", value=os.getenv("GROQ_MODEL", sh_crew.DEFAULT_MODEL),
                                  help="Confirm the exact ID and free-tier limits in the Groq console.")
+        scout_model = st.text_input("Scout agent model (uses the search tool)", value=os.getenv("GROQ_SCOUT_MODEL", sh_crew.DEFAULT_SCOUT_MODEL),
+                                    help="gpt-oss models break CrewAI's tool loop on Groq, so the Scout uses a different model.")
         parallel = st.checkbox("Run Tasks 3a/3b in parallel", value=True,
                                help="Turn off if you hit Groq free-tier rate limits.")
     run_clicked = st.button("🚀 Run Agents", type="primary", use_container_width=True)
@@ -132,7 +134,8 @@ def execute():
             step("Profile", "done")
 
             step("Scout", "run")
-            raw, queries, warn = sh_crew.scout_opportunities(profile, level, max_searches, llm)
+            scout_llm = sh_crew.get_llm(api_key, scout_model)
+            raw, queries, warn = sh_crew.scout_opportunities(profile, level, max_searches, scout_llm)
             if warn:
                 warnings.append(warn)
             step("Scout", "done")
