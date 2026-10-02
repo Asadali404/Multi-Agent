@@ -1,0 +1,6 @@
+.env
+.streamlit/secrets.toml
+data/tracker_state.json
+__pycache__/
+*.pyc
+.venv/
