@@ -20,22 +20,16 @@ import tools  # noqa: E402
 import tracker  # noqa: E402
 from schemas import CandidateProfile, GapReport, RawResult, ScholarshipRecord  # noqa: E402
 
-DEFAULT_MODEL = "openai/gpt-oss-120b"  # confirm exact ID + free-tier limits in the Groq console
-# gpt-oss models emit native tool calls that break CrewAI's text-based tool loop on Groq,
-# so the tool-using Scout agent runs on a model without that problem.
-DEFAULT_SCOUT_MODEL = "openai/gpt-oss-120b"
+MODEL = "groq/openai/gpt-oss-120b"  # the only model used by every agent
 SEED_PATH = Path(__file__).parent / "data" / "seed_scholarships.json"
 
 
 # ----------------------------------------------------------------------------
 # LLM + helpers
 # ----------------------------------------------------------------------------
-def get_llm(api_key: str, model: Optional[str] = None, temperature: float = 0.1) -> LLM:
-    model = (model or os.getenv("GROQ_MODEL") or DEFAULT_MODEL).strip()
-    if not model.startswith("groq/"):
-        model = "groq/" + model
+def get_llm(api_key: str, temperature: float = 0.1) -> LLM:
     os.environ["GROQ_API_KEY"] = api_key
-    return LLM(model=model, api_key=api_key, temperature=temperature, max_tokens=6000)
+    return LLM(model=MODEL, api_key=api_key, temperature=temperature, max_tokens=6000)
 
 
 def _balanced(text: str, start: int) -> Optional[str]:
@@ -87,12 +81,15 @@ def extract_json(text):
     raise ValueError("Could not find valid JSON in the model output")
 
 
+NO_TOOLS = "\n\nDo not call any tools or functions. Reply with plain text only."
+
+
 def _run(agent_factory: Callable[[], Agent], description: str, expected: str, inputs: dict, attempts: int = 4) -> str:
     """Run one task in its own single-agent crew; back off on Groq rate limits."""
     last: Optional[Exception] = None
     for attempt in range(attempts):
         agent = agent_factory()
-        task = Task(description=description, expected_output=expected, agent=agent)
+        task = Task(description=description + NO_TOOLS, expected_output=expected, agent=agent)
         crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
         try:
             out = crew.kickoff(inputs={k: str(v) for k, v in inputs.items()})
@@ -100,6 +97,9 @@ def _run(agent_factory: Callable[[], Agent], description: str, expected: str, in
         except Exception as exc:  # noqa: BLE001
             last = exc
             msg = str(exc).lower()
+            if attempt < attempts - 1 and any(k in msg for k in ("tool choice is none", "tool_use_fail", "called a tool")):
+                time.sleep(2)  # gpt-oss sometimes emits a stray tool call; a retry normally succeeds
+                continue
             if attempt < attempts - 1 and any(k in msg for k in ("rate limit", "rate_limit", "429", "tokens per minute", "tpm", "overloaded", "timeout")):
                 time.sleep(20 * (attempt + 1))
                 continue
@@ -178,7 +178,11 @@ def _fallback_queries(profile: CandidateProfile, level: str) -> List[str]:
 
 
 def scout_opportunities(profile: CandidateProfile, level: str, max_searches: int, llm: LLM) -> Tuple[List[RawResult], List[str], str]:
-    """Returns (raw_results deduplicated by URL, queries used, warning)."""
+    """Returns (raw_results deduplicated by URL, queries used, warning).
+
+    gpt-oss-120b on Groq cannot drive CrewAI's text-based tool loop (it emits native tool calls that Groq rejects),
+    so the Scout agent decides WHAT to search and the capped ddg_search implementation executes the queries.
+    """
     max_searches = max(1, min(int(max_searches), 5))
     tools.reset_budget(max_searches)
 
@@ -187,30 +191,38 @@ def scout_opportunities(profile: CandidateProfile, level: str, max_searches: int
             role="Scholarship Intelligence Researcher",
             goal="Find currently open scholarships, fellowships and funded positions that match the candidate.",
             backstory="You are an expert funding researcher who prefers official sources (.edu, .gov, .ac. and official programme domains) over blogs.",
-            llm=llm, tools=[tools.ddg_search], allow_delegation=False, verbose=False, max_iter=max_searches + 4,
+            llm=llm, tools=[], allow_delegation=False, verbose=False, max_iter=3,
         )
 
     description = (
-        "Find currently open scholarships, fellowships and funded positions (year {year}) for this candidate.\n"
+        "Plan web searches that will find currently open scholarships, fellowships and funded positions "
+        "(year {year}) for this candidate.\n"
         "Keywords: {keywords}\nCountries: {countries}\nLevel: {level}\n"
-        "Call ddg_search at most {max_searches} times in total (the tool refuses more). Make every query different "
-        "and specific (include level, a country, 'fully funded' and the year {year}). Prefer official programme, "
-        "university and government sources over blogs and aggregators. When finished, reply with a one-line list of the queries you ran."
+        "Write exactly {max_searches} different, specific search queries (include the level, a country, 'fully funded' "
+        "and the year {year}; aim at official programme, university and government pages). "
+        "Return ONLY a JSON array of {max_searches} query strings."
     )
+    queries: List[str] = []
     warning = ""
     try:
-        _run(factory, description, "A one-line list of the search queries that were run.",
-             dict(year=date.today().year, keywords=", ".join(profile.keywords), countries=", ".join(profile.countries),
-                  level=level, max_searches=max_searches))
-    except Exception as exc:  # keep whatever the tool already collected
-        warning = f"Scout agent stopped early ({str(exc)[:110]}); remaining searches were run directly."
+        data = _run_json(factory, description, "A JSON array of search query strings.",
+                         dict(year=date.today().year, keywords=", ".join(profile.keywords),
+                              countries=", ".join(profile.countries), level=level, max_searches=max_searches))
+        if isinstance(data, dict):
+            data = data.get("queries") or next((v for v in data.values() if isinstance(v, list)), [])
+        queries = [str(q).strip() for q in data if str(q).strip()]
+    except Exception as exc:
+        warning = f"Scout could not plan queries ({str(exc)[:100]}); built-in queries were used."
 
-    # Safety net: if the agent loop failed or found nothing, spend the remaining budget on code-built queries.
-    if warning or not tools.collected_results():
-        for q in _fallback_queries(profile, level):
-            if tools.BUDGET.used >= tools.BUDGET.max_calls:
-                break
-            tools.run_search(q)
+    for q in _fallback_queries(profile, level):  # top up if the agent returned fewer than needed
+        if len(queries) >= max_searches:
+            break
+        if q not in queries:
+            queries.append(q)
+
+    for q in queries[:max_searches]:
+        tools.run_search(q)  # hard cap enforced inside run_search
+        time.sleep(1)
 
     # Results are harvested in code from the tool -> deduplicated, ranked by source trust.
     seen, raw = set(), []
