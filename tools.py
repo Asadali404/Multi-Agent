@@ -49,11 +49,8 @@ def queries_used() -> List[str]:
         return list(BUDGET.queries)
 
 
-@tool("ddg_search")
-def ddg_search(query: str) -> str:
-    """Search the web with DuckDuckGo. Input: one short, specific search query string about scholarships,
-    fellowships or funded positions. Returns up to 6 results (title, url, snippet). The number of calls
-    per run is strictly limited; once the limit is reached the tool returns a stop message."""
+def run_search(query: str) -> str:
+    """Capped DuckDuckGo search; shared by the agent tool and the code fallback."""
     with BUDGET.lock:
         if BUDGET.used >= BUDGET.max_calls:
             return "SEARCH LIMIT REACHED. Do not call ddg_search again. Give your final answer now."
@@ -84,6 +81,14 @@ def ddg_search(query: str) -> str:
             BUDGET.results.append({"title": title, "url": url, "snippet": snippet, "query": query})
             lines.append(f"- {title} | {url} | {snippet[:180]}")
     return f"Search {call_no}/{BUDGET.max_calls} results:\n" + "\n".join(lines)
+
+
+@tool("ddg_search")
+def ddg_search(query: str) -> str:
+    """Search the web with DuckDuckGo. Input: one short, specific search query string about scholarships,
+    fellowships or funded positions. Returns up to 6 results (title, url, snippet). The number of calls
+    per run is strictly limited; once the limit is reached the tool returns a stop message."""
+    return run_search(query)
 
 
 # ----------------------------------------------------------------------------
