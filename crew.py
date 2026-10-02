@@ -27,9 +27,68 @@ SEED_PATH = Path(__file__).parent / "data" / "seed_scholarships.json"
 # ----------------------------------------------------------------------------
 # LLM + helpers
 # ----------------------------------------------------------------------------
+_REACT_LINE = re.compile(r"^\s*(thought|action|action input|observation|final answer)\s*:", re.I)
+_PLAIN = "Reply directly with the requested content as plain text. Do not call any tools or functions."
+
+
+def _sanitize(messages):
+    """Remove CrewAI's ReAct format instructions. gpt-oss reads 'Final Answer' as a function name
+    and emits a tool call ({"name": "Answer"}) that Groq rejects, so we ask for plain text instead."""
+    out = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, str):
+            out.append(m)
+            continue
+        keep = []
+        for line in content.split("\n"):
+            low = line.lower()
+            if _REACT_LINE.match(line) or "i must use these formats" in low or "to give my best complete final answer" in low:
+                continue
+            keep.append(line)
+        out.append({**m, "content": re.sub(r"(?i)final answer", "answer", "\n".join(keep))})
+    out.append({"role": "user", "content": _PLAIN})
+    return out
+
+
+class GptOssGroqLLM(LLM):
+    """CrewAI LLM for openai/gpt-oss-120b on Groq. Calls Groq through LiteLLM with plain-text prompts and
+    hands the text back to CrewAI in the format its parser expects."""
+
+    def __init__(self, api_key: str, temperature: float = 0.1):
+        super().__init__(model=MODEL, api_key=api_key, temperature=temperature, max_tokens=6000)
+        self._groq_key = api_key
+        self._groq_temp = temperature
+
+    def call(self, messages, *args, **kwargs):
+        import litellm
+
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        clean = _sanitize(messages)
+        last_exc = None
+        for attempt in range(3):
+            try:
+                resp = litellm.completion(model=MODEL, api_key=self._groq_key, messages=clean,
+                                          temperature=self._groq_temp, max_tokens=6000)
+                text = (resp.choices[0].message.content or "").strip()
+                if not text:
+                    raise ValueError("Model returned an empty answer")
+                return "Thought: I now can give a great answer\nFinal Answer: " + text
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc).lower()
+                if attempt < 2 and any(k in msg for k in ("tool_use_fail", "tool choice is none", "empty answer")):
+                    clean = clean + [{"role": "user", "content": "Write the answer as ordinary text in your reply."}]
+                    time.sleep(2)
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
+
+
 def get_llm(api_key: str, temperature: float = 0.1) -> LLM:
     os.environ["GROQ_API_KEY"] = api_key
-    return LLM(model=MODEL, api_key=api_key, temperature=temperature, max_tokens=6000)
+    return GptOssGroqLLM(api_key, temperature)
 
 
 def _balanced(text: str, start: int) -> Optional[str]:
