@@ -23,7 +23,7 @@ from schemas import CandidateProfile, GapReport, RawResult, ScholarshipRecord  #
 DEFAULT_MODEL = "openai/gpt-oss-120b"  # confirm exact ID + free-tier limits in the Groq console
 # gpt-oss models emit native tool calls that break CrewAI's text-based tool loop on Groq,
 # so the tool-using Scout agent runs on a model without that problem.
-DEFAULT_SCOUT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_SCOUT_MODEL = "openai/gpt-oss-120b"
 SEED_PATH = Path(__file__).parent / "data" / "seed_scholarships.json"
 
 
